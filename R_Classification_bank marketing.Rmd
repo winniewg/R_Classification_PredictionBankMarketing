@@ -1,0 +1,577 @@
+
+---
+title: "Classification Project - Bank Marketing"
+author: "Wai Ying, Wong"
+date: "2023-07-10"
+output:
+  html_document:
+    df_print: paged
+---
+
+# 1. Library import
+
+```{r}
+library(MASS)
+library(dplyr)
+library(fastDummies)
+library(randomForest)
+library(e1071)
+library(xgboost)
+library(data.table)
+library(mltools)
+library(stringr)
+library(caret)
+```
+
+# 2. Import data
+```{r}
+
+# read file
+data <- read.csv("bank-additional-full.csv", header = TRUE, sep = ",", na = "unknown")
+
+# remove all unknown rows
+data <-na.omit(data)
+
+# job implies age group, can drop age. There may be offsetting effect if keeping both
+aggregate(age ~ job, data = data, FUN = mean)
+
+# default only has 3 positive records, drop it too
+data <- data %>% select(-c(age, default))
+
+# change admin. => admin (just for cleaner data, no technical reason)
+data$job[data$job == "admin."] <- "admin"
+
+# Binning all basic education to basic
+data$education[str_detect(data$education, "basic")] <- "basic"
+
+#check the row after cleaning
+nrow(data)
+```
+
+
+# 3. Data Exploratory
+
+```{r}
+#Get the names of all categorical columns in the data frame
+categorical_columns <- data %>%
+  select_if(is.character) %>%
+  colnames()
+
+# Create a loop to plot pie charts for all categorical columns
+for (col in categorical_columns) {
+  p <- ggplot(data, aes(x = "", fill = .data[[col]])) +
+    geom_bar(width = 1) +
+    coord_polar("y", start = 0) +
+    geom_text(aes(label = paste0(round((..count..)/sum(..count..) * 100), "%")), stat = "count", position = position_stack(vjust = 0.5)) +
+    labs(title = paste0("Percentage Distribution of ", col))
+  
+  print(p)
+}
+```
+
+```{r}
+# Select numerical columns
+numerical <- names(df)[sapply(df, is.numeric)]
+
+# Function to create histograms with 'y' separation
+plot_histograms <- function(data, column) {
+  ggplot(data, aes(x = .data[[column]], fill = y)) +
+    geom_histogram(position = "stack", bins = 30) +
+    scale_fill_manual(values = c("pink", "navy")) +
+    labs(title = paste("Distribution of", column, "client subscribed to a term deposit"))
+}
+
+plots_list <- list()
+
+# Create and store the histograms in the list using 'lapply'
+for (col in numerical) {
+  hist_plot <- plot_histograms(df, col)
+  plots_list <- c(plots_list, list(hist_plot))
+}
+
+plots_list
+```
+
+
+# 4. Data Transformation
+
+```{r}
+# change yes & no to 1 & 0
+data$y[data$y == "yes"] <- 1
+data$y[data$y == "no"] <- 0
+data$y <- as.numeric(data$y)
+```
+
+##Scale data
+```{r}
+# scale numeric data (excluded pdays as pday=999 means never happened instead of its numerical meaning)
+scaled_vars <- scale(data %>% select(c(duration, previous, emp.var.rate, cons.price.idx, cons.conf.idx, euribor3m, nr.employed)))
+data <- cbind(data %>% select(-c(duration, previous, emp.var.rate, cons.price.idx, cons.conf.idx, euribor3m, nr.employed)), scaled_vars)
+
+head(data)
+```
+
+
+
+## Change all categorical data column to data type = factor
+```{r}
+# Columns to convert to factors
+cols_to_convert <- c("job", "marital", "education", "housing", "loan", "contact", "month", "day_of_week", "poutcome")
+
+# Apply factor() to each column using lapply()
+data[, cols_to_convert] <- lapply(subset(data, select=cols_to_convert), factor)
+
+head(data)
+```
+## Transform all categorical data columns to 0 & 1 columns for xgboost 
+```{r}
+set.seed(123)
+cate_df <- subset(data, select=c(job, marital,housing, education, loan, contact, month, poutcome, day_of_week))
+one_hot_cate <- one_hot(as.data.table(cate_df))
+
+onehot_df <- cbind(one_hot_cate, subset(data, select=-c(job, marital, housing, education, loan, contact, month, poutcome, day_of_week)))
+onehot_df <- janitor::clean_names(onehot_df)
+
+# drop first category of each categorical variable (read https://inmachineswetrust.com/posts/drop-first-columns/ for reasons, search for linear combination in this article)
+onehot_df <- onehot_df %>% select(-c(job_admin, marital_divorced, housing_no, education_basic, loan_no, contact_telephone, month_apr, poutcome_nonexistent, day_of_week_fri))
+
+head(onehot_df)
+```
+
+## Calculate the ratio of +ve resp to -ve resp
+```{r}
+resp_yes_df <- data %>% filter(y==1)
+resp_no_df <- data %>% filter(y==0)
+nrow_resp_yes <- nrow(resp_yes_df)
+nrow_resp_no <- nrow(resp_no_df)
+ratio <- (nrow_resp_yes / nrow_resp_no) * 100
+
+ratio_df <- data.frame(
+  Response_Type = c("Yes", "No"),
+  Count = c(nrow_resp_yes, nrow_resp_no),
+  Ratio = c(ratio, 100)  # NA for the "No" response
+)
+
+print(ratio_df)
+```
+
+
+## Balancing the number of +ve and -ve resp for one_hot encoded dataframe
+```{r}
+set.seed(123)
+sample_size <- nrow(resp_yes_df)
+selected_rows <- sample(1:nrow(resp_no_df), size=sample_size) 
+#gives row indices
+#extract subsample that matches the row indices randomly selected
+matched_resp_no_df <- resp_no_df[selected_rows,]
+nrow(matched_resp_no_df)
+head(matched_resp_no_df)
+```
+
+### make a balanced dataset & shuffle records
+```{r}
+# Combine +ve and -ve records
+combined_df <- rbind(resp_yes_df,matched_resp_no_df)
+
+# Shuffling
+shuffled_df <-combined_df[sample(1:nrow(combined_df)),]
+head(shuffled_df)
+```
+
+## Create a balanced, one-hot encoded dataset for xgboost to use later
+```{r}
+onehot_yes <- onehot_df %>% filter(y==1)
+onehot_no <- onehot_df %>% filter(y==0)
+onehot_no_matched <- onehot_no[selected_rows,]
+
+combined_onehot <- rbind(onehot_yes, onehot_no_matched)
+
+# shuffling
+onehot_shuffled <- combined_onehot[sample(1:nrow(combined_onehot)),]
+head(onehot_shuffled)
+
+```
+-- get variable correlations (only the correlation between each independent variable and the outcome variable, not the entire correlation matrix)
+
+```{r}
+ind_vars <- subset(onehot_shuffled, select = -c(y))
+dv <- subset(onehot_shuffled, select = c(y))
+head(ind_vars)
+head(dv)
+```
+--get Pearson correlations using the cor() function
+```{r}
+cor_vect <- cor(ind_vars,dv)
+#put column header
+colnames(cor_vect) <- "cor.coeff"
+cor_vect
+```
+-- get the significance of the correlation coefficients (p-values)
+-- use the cor.test() function (one by one) - need a loop
+```{r}
+#create an empty vector - will be used to store p-values
+p_val <- c()
+for (val in ind_vars){
+  p_val <- c(p_val,cor.test(val,dv$y)$p.value)
+}
+
+#combine the correlation coefficients and the p-values into a data.frame
+cor_sigs_p <- as.data.frame(cbind(cor_vect,p_val))
+
+#display the result rounded to 4 decimal places -- use round() function
+round(cor_sigs_p,4)
+
+```
+
+
+
+# 5. Data Mode
+
+##Estimate the explanatory model
+###Check insignificant vars
+```{r}
+log_res <- glm(y~., data=shuffled_df, family=binomial(link="logit"))
+summary(log_res)
+anova(log_res) #how much each variable contributes to reduction in deviance statistic
+```
+
+# Backward-stepwise
+```{r}
+step_log_reg <- stepAIC(log_res,direction="backward",trace=FALSE)
+```
+
+# Model summary and anova
+```{r}
+summary(step_log_reg)
+anova(step_log_reg)
+```
+## Overall Fit (Omnibus Test)
+###Compute the difference between null deviance and residual deviance
+the computed statistics follows a Chi-squared distribution
+```{r}
+with(step_log_reg, null.deviance-deviance)
+```
+###Compute the p-value for the Chi-squared statistic
+```{r}
+options(scipen=999)
+with(step_log_reg,pchisq(null.deviance-deviance, df.null-df.residual, lower.tail = FALSE))
+```
+
+
+### Continue with retained vars
+```{r}
+retained_vars <- c("job", "education", "contact","month","duration", "campaign", "poutcome", "emp.var.rate", "cons.price.idx" ,"euribor3m", "nr.employed", "y")
+df_class <- subset(shuffled_df,select=retained_vars)
+
+cate_df <- subset(df_class, select=c(job, education, contact, month, poutcome))
+one_hot_cate <- one_hot(as.data.table(cate_df))
+df_class <- cbind(one_hot_cate, subset(df_class, select=-c(job, education, contact, month, poutcome)))
+
+df_class <- janitor::clean_names(df_class)
+
+# drop first category of each categorical variable (read https://inmachineswetrust.com/posts/drop-first-columns/ for reasons, search for linear combination in this article)
+df_class <- df_class %>% select(-c(job_admin, education_basic, contact_cellular , month_apr, poutcome_failure))
+head(df_class)
+
+```
+
+
+# 6. Prepare the features and target variable
+
+
+## Split test-train data
+```{r}
+set.seed(123)
+train_size <- nrow(df_class)*0.7
+train_rows <- sample(1:nrow(df_class), size=train_size) #gives row indices
+#extract subsample that matches the row indices randomly selected
+train_df <- df_class[train_rows,]
+test_df <- df_class[-train_rows,]
+nrow(train_df)
+nrow(test_df)
+```
+
+
+
+# 7. Run Training Models (using training dataset)
+
+##7.1 Logistic Classifier
+##===============================
+
+# one-hotted 
+```{r}
+log_class <- glm(y ~., data=train_df, family=binomial(link="logit"))
+summary(log_class)
+
+logit_pred <- predict(log_class, test_df, type="response")
+logit_pred[logit_pred > 0.5] <- 1
+logit_pred[logit_pred <= 0.5] <- 0
+
+sum(logit_pred == test_df$y) / nrow(test_df)
+```
+
+##7.2 RandomForest
+##===============================
+```{r}
+rf_model <- randomForest(y ~ ., data = train_df)
+
+# Make predictions on the test set
+rf_pred <- predict(rf_model, test_df, type="response")
+
+```
+
+
+##7.3 SVM
+##===============================
+```{r}
+svmfit = svm(y ~ ., data = train_df, kernel = "linear", scale = FALSE)
+svm_pred <- predict(svmfit, test_df, type="response")
+
+```
+
+
+##7.4 XGboost
+##===============================
+```{r}
+train_mat_x <- apply(as.matrix(subset(train_df, select=-c(y))), 2, as.numeric)
+train_mat_y <- apply(as.matrix(subset(train_df, select=c(y))), 2, as.numeric)
+test_mat_x <- apply(as.matrix(subset(test_df, select=-c(y))), 2, as.numeric)
+test_mat_y <- apply(as.matrix(subset(test_df, select=c(y))), 2, as.numeric)
+xgb_train <- xgb.DMatrix(data=train_mat_x, label = train_mat_y)
+xgb_test <- xgb.DMatrix(data=test_mat_x, label = test_mat_y)
+xgb_mod = xgboost(data = xgb_train, max.depth = 3, nrounds = 56, verbose = 0, objective = "binary:logistic")
+
+xgb_pred <- predict(xgb_mod, xgb_test, type="response")
+
+```
+
+
+##7.5 Decision tree
+##===============================
+```{r}
+library(rpart)
+#install.packages("rpart.plot")
+library(rpart.plot)
+dtree_class <- rpart(y ~.,data=train_df,control=rpart.control(cp=0.001))
+
+##plot decision tree
+rpart.plot(dtree_class)
+```
+
+
+##7.6: AdaBoost Classifier
+##===============================
+```{r}
+library(ada)
+ada_train <- ada(y~., data=train_df, type="gentle")
+```
+
+##7.7: Linear SVM
+##===============================
+```{r}
+library(e1071)
+linear_svm <- svm(y ~., data=train_df, kernel="linear")
+```
+
+##7.8: Non-Linear SVM
+##===================================
+```{r}
+nonlinear_svm <- svm(y ~., data=train_df, kernel="radial")
+```
+
+##7.9: Neural Network Classifier (Simple Perceptron)
+##============================
+```{r}
+library(neuralnet)
+nn_train <- neuralnet(y ~., data=train_df,hidden=3,act.fct="logistic")
+#plot(nn_train)
+```
+
+##7.10: KNN Classifier
+##============================
+```{r}
+library(class)
+train_xs <- train_df %>% select(-c(y))
+test_xs <- test_df %>% select(-c(y))
+knn_train <- knn(train=train_xs, test=test_xs, cl=train_df$y,k=25,prob=TRUE)
+
+```
+
+
+8. Data Prediction base on the classifier models
+
+# Make prediction
+```{r}
+
+  log_reg_pred <- predict(log_class,test_df,type="response")
+  dt_pred <-predict(dtree_class, test_df)
+  rf_pred <-predict(rf_model, test_df)
+  ada_pred <- predict(ada_train,test_df)
+  svm_linear_pred <- predict(linear_svm,test_df)
+  svm_nl_pred <- predict(nonlinear_svm,test_df)
+  nn_pred <- predict(nn_train,test_df)
+  xgb_pred <- predict(xgb_mod, as.matrix(test_xs))
+  svm_pred <- predict(svmfit, test_df, type="response")
+
+# Create a named list to store predictions
+pred_list <- list(
+  log_reg = log_reg_pred,
+  svm_linear = svm_linear_pred,
+  svm_nl = svm_nl_pred,
+  dtree = dt_pred,
+  xgb = xgb_pred,
+  nn = nn_pred,
+  rf = rf_pred,
+  svm = svm_pred,
+  ada = ada_pred,
+  knn = knn_train
+)
+
+
+```
+
+cm_knn <- confusionMatrix(as.factor(knn_train), as.factor(test_df$y))
+
+## Select the best classifier base on their accuracy
+```{r}
+#List to store cm and accuracies
+cm_list <- list()
+accuracies <- (length(pred_list))
+accuracies <- c()
+
+# Loop through the named list and calculate accuracy
+for (model_name in names(pred_list)) {
+  pred <- pred_list[[model_name]]
+  pred_disc <- ifelse(pred > 0.5, 1, 0)
+  
+  if (model_name == "ada") {
+    cm_ada <- confusionMatrix(ada_pred, as.factor(test_df$y))
+    accuracies[model_name] <- cm_ada$overall['Accuracy']
+    cm_list <- append(cm_list, list(cm_ada))
+  } else if (model_name == "knn"){
+    # Make sure factor levels match
+    cm_knn <- confusionMatrix(as.factor(knn_train), as.factor(test_df$y))
+    accuracies[model_name] <- cm_knn$overall['Accuracy']
+    cm_list <- append(cm_list, list(cm_knn))
+  }
+  else {
+    # Make sure factor levels match
+    cm <- confusionMatrix(as.factor(pred_disc), as.factor(test_df$y ))
+    accuracies[model_name] <- cm$overall['Accuracy']
+    cm_list <- append(cm_list, list(cm))
+  }
+  
+}
+
+#append the cm list
+#cm_list <- append(cm_list, list(cm_ada))
+
+# List of classifier names
+classifier_names <- c("Logistic Regression", "Linear SVM", "Non-linear SVM", 
+                     "Decision Tree", "XGBoost","Neural Network Classifier","RandomForest","SVM","AdaBoost", "KNN")
+
+# Create empty lists to store classifier names and accuracies
+classifier_results <- c()
+accuracy_results <- c()
+
+
+# Create an empty dataframe to store results
+result_df <- data.frame(Classifier = character(0), Accuracy = numeric(0))
+
+# Loop through the list of predictions
+for (i in seq_along(accuracies)) {
+    classifier_name <- classifier_names[i]
+    classifier_results <- c(classifier_results, classifier_name)
+    accuracy_results <- c(accuracy_results, accuracies[i])
+}
+
+# Create a dataframe from the results
+result_df <- data.frame(Classifier = classifier_results, Accuracy = accuracy_results)
+sorted_result_df <- result_df %>%
+  arrange(desc(Accuracy))
+
+# Print the resulting dataframe with deceasing order by accuracy
+print(sorted_result_df)
+```
+
+
+# 9. Evaluation of Classifer 
+
+##Confusion Matrix
+
+```{r}
+library("ggimage")
+library("rsvg")
+library(cvms)
+
+titles <- c("Logistic Regression", "Linear SVM", "Non-linear SVM", 
+                     "Decision Tree", "XGBoost","Neural Network Classifier", "RandomForest", "SVM","AdaBoost", "KNN")
+
+plot_list <- list()
+
+for (i in seq_along(titles)) {
+
+  cm <- cm_list[[i]]
+  title <- titles[i]
+  
+  print(plot_confusion_matrix(as_tibble(cm$table), target_col = "Reference", counts_col = "n") + labs(title = paste(title, "Confusion Matrix")))
+}
+
+```
+
+
+# 10. Out-of-sample Predictions
+
+```{r}
+outOfSample <- data.frame(
+  job_blue_collar = c(0),
+  job_entrepreneur = c(0),
+  job_housemaid = c(0),
+  job_management = c(0),
+  job_retired = c(1),
+  job_self_employed = c(0 ),
+  job_services = c(0 ),
+  job_student = c(0 ),
+  job_technician = c(0 ),
+  job_unemployed = c( 0),
+  education_high_school = c( 0),
+  education_illiterate = c(0 ),
+  education_professional_course = c( 0),
+  education_university_degree = c(1),
+  contact_telephone = c(0),
+  month_aug = c(1),
+  month_dec = c(0),
+  month_jul = c(0),
+  month_jun = c(0),
+  month_mar = c(0),
+  month_may = c(0),
+  month_nov = c(0),
+  month_oct = c(0),
+  month_sep = c(0),
+  poutcome_nonexistent = c(0),
+  poutcome_success = c(1),
+  duration = c(5),
+  campaign = c(1),
+  emp_var_rate = c(-0.8),
+  cons_price_idx = c(5),
+  euribor3m = c(3),
+  nr_employed = c(0.2)
+)
+
+print(outOfSample)
+```
+
+```{r}
+# Make predictions on the out-of-sample data
+outOfSample_pred <- predict(rf_model, as.matrix(outOfSample))
+outOfSample_pred <- ifelse(outOfSample_pred >= 0.5, 1, 0)
+print(outOfSample_pred)
+
+```
+
+
+
+
+
+
+
